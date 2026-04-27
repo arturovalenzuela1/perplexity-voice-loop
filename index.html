@@ -41,6 +41,31 @@
     .content {
       color: #fff;
     }
+    #controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 16px;
+      border-top: 1px solid #333;
+    }
+    #startBtn {
+      background: #03a9f4;
+      color: #000;
+      border: 0;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-weight: 700;
+      font-size: 16px;
+    }
+    #stopBtn {
+      background: #333;
+      color: #fff;
+      border: 0;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-weight: 700;
+      font-size: 16px;
+    }
     #statusBar {
       border-top: 1px solid #333;
       padding: 8px 16px;
@@ -84,10 +109,16 @@
 <body>
   <div id="app">
     <div id="chat"></div>
+
+    <div id="controls">
+      <button id="startBtn">Start Listening</button>
+      <button id="stopBtn">Stop</button>
+    </div>
+
     <div id="statusBar">
       <div id="statusLeft">
         <div id="statusDot" class="dot"></div>
-        <span id="statusText">Tap once to start listening…</span>
+        <span id="statusText">Ready.</span>
       </div>
       <div id="statusRight">
         <span id="partialTranscript"></span>
@@ -96,13 +127,217 @@
   </div>
 
   <script>
-    // ==== CONFIG ====
-    const PERPLEXITY_API_KEY = "YOUR_API_KEY_HERE"; // <-- replace
+    const PERPLEXITY_API_KEY = "YOUR_API_KEY_HERE";
     const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
-    const MODEL_NAME = "sonar"; // or "sonar-pro" if your key supports it
-    const SILENCE_MS = 4000; // 4-second hard pause
+    const MODEL_NAME = "sonar";
+    const SILENCE_MS = 4000;
 
     const chatEl = document.getElementById("chat");
     const statusDotEl = document.getElementById("statusDot");
     const statusTextEl = document.getElementById("statusText");
-    const 
+    const partialTranscriptEl = document.getElementById("partialTranscript");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+
+    function appendMessage(role, text) {
+      const msg = document.createElement("div");
+      msg.className = "message " + role;
+
+      const roleEl = document.createElement("div");
+      roleEl.className = "role";
+      roleEl.textContent = role === "user" ? "You" : "Perplexity";
+
+      const contentEl = document.createElement("div");
+      contentEl.className = "content";
+      contentEl.textContent = text;
+
+      msg.appendChild(roleEl);
+      msg.appendChild(contentEl);
+      chatEl.appendChild(msg);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function setStatus(mode, text) {
+      statusDotEl.className = "dot";
+      if (mode === "listening") statusDotEl.classList.add("listening");
+      if (mode === "thinking") statusDotEl.classList.add("thinking");
+      if (mode === "error") statusDotEl.classList.add("error");
+      statusTextEl.textContent = text;
+    }
+
+    function setPartialTranscript(text) {
+      partialTranscriptEl.textContent = text || "";
+    }
+
+    let recognition = null;
+    let currentTranscript = "";
+    let lastSpeechTime = Date.now();
+    let silenceTimer = null;
+    let recognitionActive = false;
+    let sending = false;
+
+    function initSpeechRecognition() {
+      const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognitionCtor) {
+        setStatus("error", "SpeechRecognition not supported on this browser.");
+        appendMessage("assistant", "Speech recognition is not supported here. Try Chrome on Android or a desktop browser.");
+        return false;
+      }
+
+      recognition = new SpeechRecognitionCtor();
+      recognition.lang = "en-US";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = () => {
+        recognitionActive = true;
+        setStatus("listening", "Listening… ask your question out loud.");
+      };
+
+      recognition.onresult = (event) => {
+        let interim = "";
+        let finalText = "";
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const transcript = result[0].transcript.trim();
+          if (!transcript) continue;
+          if (result.isFinal) finalText += transcript + " ";
+          else interim += transcript + " ";
+        }
+
+        if (finalText) {
+          currentTranscript += finalText;
+          lastSpeechTime = Date.now();
+        } else if (interim) {
+          lastSpeechTime = Date.now();
+        }
+
+        setPartialTranscript((currentTranscript + " " + interim).trim());
+      };
+
+      recognition.onerror = (event) => {
+        console.error("SpeechRecognition error:", event);
+        setStatus("error", "Speech error: " + (event.error || "unknown"));
+      };
+
+      recognition.onend = () => {
+        recognitionActive = false;
+        if (!sending) {
+          setStatus("listening", "Restarting listener…");
+          tryStartRecognition();
+        }
+      };
+
+      return true;
+    }
+
+    function tryStartRecognition() {
+      if (!recognition) return;
+      try {
+        recognition.start();
+      } catch (e) {
+        console.warn("Recognition start error:", e);
+      }
+    }
+
+    function stopRecognition() {
+      if (silenceTimer) {
+        clearInterval(silenceTimer);
+        silenceTimer = null;
+      }
+      if (recognition) {
+        try {
+          recognition.stop();
+        } catch (e) {
+          console.warn("Recognition stop error:", e);
+        }
+      }
+      recognitionActive = false;
+      setStatus("ready", "Stopped.");
+    }
+
+    function startSilenceWatcher() {
+      if (silenceTimer) clearInterval(silenceTimer);
+      silenceTimer = setInterval(() => {
+        if (sending) return;
+        const elapsed = Date.now() - lastSpeechTime;
+        const text = currentTranscript.trim();
+        if (text && elapsed >= SILENCE_MS) {
+          handleQuestion(text);
+          currentTranscript = "";
+          setPartialTranscript("");
+        }
+      }, 250);
+    }
+
+    async function callPerplexity(question) {
+      const body = {
+        model: MODEL_NAME,
+        messages: [{ role: "user", content: question }]
+      };
+
+      const response = await fetch(PERPLEXITY_API_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + PERPLEXITY_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!response.ok) {
+        const t = await response.text();
+        throw new Error("Perplexity API error: " + response.status + " " + t);
+      }
+
+      const data = await response.json();
+      return data?.choices?.[0]?.message?.content || data?.output || "I could not generate an answer.";
+    }
+
+    async function handleQuestion(question) {
+      if (!question.trim()) return;
+      sending = true;
+      setStatus("thinking", "Thinking… researching with Perplexity.");
+      setPartialTranscript("");
+
+      appendMessage("user", question);
+      appendMessage("assistant", "…");
+
+      try {
+        const answer = await callPerplexity(question);
+        const messages = chatEl.getElementsByClassName("assistant");
+        const last = messages[messages.length - 1];
+        last.querySelector(".content").textContent = answer;
+      } catch (err) {
+        console.error(err);
+        setStatus("error", "API error. See console.");
+        const messages = chatEl.getElementsByClassName("assistant");
+        const last = messages[messages.length - 1];
+        last.querySelector(".content").textContent = "Error talking to Perplexity API.";
+      } finally {
+        sending = false;
+        lastSpeechTime = Date.now();
+        setStatus("listening", "Listening… ask your next question.");
+      }
+    }
+
+    startBtn.addEventListener("click", () => {
+      if (!recognition) {
+        const ok = initSpeechRecognition();
+        if (!ok) return;
+      }
+      startSilenceWatcher();
+      tryStartRecognition();
+    });
+
+    stopBtn.addEventListener("click", stopRecognition);
+
+    window.addEventListener("load", () => {
+      initSpeechRecognition();
+      setStatus("ready", "Tap Start Listening.");
+    });
+  </script>
+</body>
+</html>
